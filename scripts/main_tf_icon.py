@@ -15,62 +15,75 @@ import time
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.dpm_solver import DPMSolverSampler
+import pickle
+from typing import Union, Tuple, Optional
+from torchvision import transforms as tvt
 
 
-def load_img(path, SCALE, pad=False, seg=False, target_size=None):
-    if seg:
-        # Load the input image and segmentation map
-        image = Image.open(path).convert("RGB")
-        seg_map = Image.open(seg).convert("1")
-
-        # Get the width and height of the original image
-        w, h = image.size
-
-        # Calculate the aspect ratio of the original image
-        aspect_ratio = h / w
-
-        # Determine the new dimensions for resizing the image while maintaining aspect ratio
-        if aspect_ratio > 1:
-            new_w = int(SCALE * 256 / aspect_ratio)
-            new_h = int(SCALE * 256)
-        else:
-            new_w = int(SCALE * 256)
-            new_h = int(SCALE * 256 * aspect_ratio)
-
-        # Resize the image and the segmentation map to the new dimensions
-        image_resize = image.resize((new_w, new_h))
-        segmentation_map_resize = cv2.resize(np.array(seg_map).astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-
-        # Pad the segmentation map to match the target size
-        padded_segmentation_map = np.zeros((target_size[1], target_size[0]))
-        start_x = (target_size[1] - segmentation_map_resize.shape[0]) // 2
-        start_y = (target_size[0] - segmentation_map_resize.shape[1]) // 2
-        padded_segmentation_map[start_x: start_x + segmentation_map_resize.shape[0], start_y: start_y + segmentation_map_resize.shape[1]] = segmentation_map_resize
-
-        # Create a new RGB image with the target size and place the resized image in the center
-        padded_image = Image.new("RGB", target_size)
-        start_x = (target_size[0] - image_resize.width) // 2
-        start_y = (target_size[1] - image_resize.height) // 2
-        padded_image.paste(image_resize, (start_x, start_y))
-
-        # Update the variable "image" to contain the final padded image
-        image = padded_image
-    else:
-        image = Image.open(path).convert("RGB")
-        w, h = image.size        
-        print(f"loaded input image of size ({w}, {h}) from {path}")
-        w, h = map(lambda x: x - x % 64, (w, h))  # resize to integer multiple of 64
-        w = h = 512
-        image = image.resize((w, h), resample=PIL.Image.LANCZOS)
-        
+def load_bg(
+    bg_img, 
+) :
+    image = bg_img
+    w, h = image.size        
+    print(f"loaded input image of size ({w}, {h}) from {bg_img}")
+    w, h = map(lambda x: x - x % 64, (w, h))  # resize to integer multiple of 64
+    w = h = 512
+    image = image.resize((w, h), resample=PIL.Image.LANCZOS)
     image = np.array(image).astype(np.float32) / 255.0
     image = image[None].transpose(0, 3, 1, 2)
     image = torch.from_numpy(image)
+    return 2. * image - 1.
+
+def resize_with_padding(img, size=512, fill_color=0):
+    # 保持比例缩放
+    img.thumbnail((size, size), Image.Resampling.LANCZOS)
+    # 创建新图像并居中粘贴
+    if img.mode == 'L' or img.mode == '1':
+        new_img = Image.new(img.mode, (size, size), fill_color)
+    else:
+        new_img = Image.new(img.mode, (size, size), (fill_color,)*3)
+    left = (size - img.width) // 2
+    top = (size - img.height) // 2
+    new_img.paste(img, (left, top))
+    print(f"img_size = {img.size}")
+    return new_img, left, top, img.width, img.height
+
+def load_fg(
+    fg_img, 
+    seg_img,
+    target_size: tuple,
+    box_position: list  # [x1, y1, x2, y2]，像素坐标
+):
+    batch_size = 1
+    # 1. 居中填充到 target_size
+    fg_padded, left, top, fg_w, fg_h = resize_with_padding(fg_img, size=target_size[0])
+    seg_padded, _, _, _, _ = resize_with_padding(seg_img, size=target_size[0])
+
+    # 2. 转为 tensor
+    # a. 前景图 padded -> [-1, 1] Tensor
+    ref_image_tensor = 2. * tvt.ToTensor()(fg_padded).unsqueeze(0) - 1.
+    ref_image_tensor = ref_image_tensor.repeat(batch_size, 1, 1, 1)
+    # b. 分割蒙版 padded -> [0, 1] Tensor (512x512)
+    seg_padded_np = np.array(seg_padded).astype(np.float32) / 255.0
+    seg_tensor_512 = torch.from_numpy(seg_padded_np).unsqueeze(0).unsqueeze(0)
+    seg_tensor_512 = seg_tensor_512.repeat(batch_size, 1, 1, 1)
+    # c. 下采样到 latent space (64x64)
+    seg_tensor_64 = torch.nn.functional.interpolate(seg_tensor_512, scale_factor=1/8, mode='nearest')
+
+    # 3. 计算前景在 padded 图中的像素坐标 [top, bottom, left, right]
+    ref_bbox_px = [top, top + fg_h, left, left + fg_w]
+
+    # 4. 计算目标位置在 latent space 中的坐标 (top, bottom, left, right)
+    scale_x = 64 / target_size[0]
+    scale_y = 64 / target_size[1]
+    latent_bbox = (
+        int(box_position[1] * scale_y), # top (y1)
+        int(box_position[3] * scale_y), # bottom (y2)
+        int(box_position[0] * scale_x), # left (x1)
+        int(box_position[2] * scale_x)  # right (x2)
+    )
     
-    if pad or seg:
-        return 2. * image - 1., new_w, new_h, padded_segmentation_map
-    
-    return 2. * image - 1., w, h 
+    return ref_image_tensor, seg_tensor_512, seg_tensor_64, ref_bbox_px, latent_bbox, fg_w, fg_h
 
 
 def load_model_and_get_prompt_embedding(model, opt, device, prompts, inv=False):
@@ -207,7 +220,7 @@ def main():
     parser.add_argument(
         "--ckpt",
         type=str,
-        default="./ckpt/v2-1_512-ema-pruned.ckpt",
+        default="/home/gys/TFICON/TF-ICON/ckpt/v2-1_512-ema-pruned.ckpt",
         help="path to checkpoint of model",
     )
     
@@ -268,6 +281,12 @@ def main():
         help="",
         default='cuda:0'
     ) 
+    parser.add_argument(
+        "--position",
+        type=tuple,
+        help="矩形框位置[[x1, y1, x2, y2]]",
+        default='cuda:0'
+    ) 
     
     opt = parser.parse_args()       
     device = torch.device(opt.gpu) if torch.cuda.is_available() else torch.device("cpu")
@@ -287,8 +306,6 @@ def main():
         
     batch_size = opt.n_samples
     sample_path = os.path.join(outpath, file_name)
-    os.makedirs(sample_path, exist_ok=True)
-    base_count = len(os.listdir(sample_path))
 
     config = OmegaConf.load(opt.config)
     model = load_model_from_config(config, opt.ckpt, opt.gpu)    
@@ -299,94 +316,106 @@ def main():
         for file in files:
             torch.cuda.empty_cache()
             file_path = os.path.join(subdir, file)
-            result = re.search(r'./inputs/[^/]+/(.+)/bg\d+\.', file_path)
-            if result:
-                prompt = result.group(1)
-                
-            if file_path.endswith('.jpg') or file_path.endswith('.jpeg') or file_path.endswith('.png'):
-                if file.startswith('bg'):
-                    opt.init_img = file_path
-                elif file.startswith('fg') and not (file.endswith('mask.jpg') or file.endswith('mask.png')):
-                    opt.ref_img = file_path
-                elif file.startswith('mask'):
-                    opt.mask = file_path
-                elif file.startswith('fg') and (file.endswith('mask.jpg') or file.endswith('mask.png')):
-                    opt.seg = file_path
-                    
+
+            opt.prompt = os.path.basename(subdir).replace("_", " ")
+            if file.startswith('background'):
+                opt.init_img = file_path
+            elif file.startswith('foreground') and not (file.endswith('_centered.png')) :
+                opt.ref_img = file_path
+            elif file.startswith('location'):
+                opt.mask = file_path
+            elif file.startswith('segmentation'):
+                opt.seg = file_path
+            elif file.startswith("position"):
+                with open(file_path, 'rb') as positions:
+                    opt.position = pickle.load(positions)   
             if file == files[-1]:
                 seed_everything(opt.seed)
-                img = cv2.imread(opt.mask, 0)
-                # Threshold the image to create binary image
-                _, binary = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
-                # Find the contours of the white region in the image
-                contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                # Find the bounding rectangle of the largest contour
-                x, y, new_w, new_h = cv2.boundingRect(contours[0])
-                # Calculate the center of the rectangle
-                center_x = x + new_w / 2
-                center_y = y + new_h / 2
-                # Calculate the percentage from the top and left
-                center_row_from_top = round(center_y / 512, 2)
-                center_col_from_left = round(center_x / 512, 2)
+                
+                # 直接从 pickle 文件加载精确的矩形框位置 [x1, y1, x2, y2]
+                print(f"Loaded position: {opt.position}")
+                x1, y1, x2, y2 = opt.position
+                new_w, new_h = x2 - x1, y2 - y1
+                
+                # 计算中心点百分比
+                center_x = x1 + new_w / 2
+                center_y = y1 + new_h / 2
+                
+                center_row_from_top = center_y / 512
+                center_col_from_left = center_x / 512 
 
-                aspect_ratio = new_h / new_w
-                
-                if aspect_ratio > 1:  
-                    scale = new_w * aspect_ratio / 256  
-                    scale = new_h / 256
-                else:  
-                    scale = new_w / 256
-                    scale = new_h / (aspect_ratio * 256) 
-                     
-                scale = round(scale, 2)
-                
-                # =============================================================================================
-        
-                assert prompt is not None
+                prompt = opt.prompt
                 data = [batch_size * [prompt]]
                 
-                # read background image              
-                assert os.path.isfile(opt.init_img)
-                init_image, target_width, target_height = load_img(opt.init_img, scale)
+                # --- 使用新的、清晰的加载和计算流程 ---
+                
+                # 1. 加载 PIL 对象
+                bg_pil = Image.open(opt.init_img).convert("RGB")
+                fg_pil = Image.open(opt.ref_img).convert("RGB")
+                seg_pil = Image.open(opt.seg).convert("L")
+                
+                print("fg的大小草尼玛TF-ICON",fg_pil.size,"fg的大小草尼玛TF-ICON",opt.ref_img)
+                
+                # 2. 加载背景图
+                init_image = load_bg(bg_pil).to(device)
                 init_image = repeat(init_image.to(device), '1 ... -> b ...', b=batch_size)
-                save_image = init_image.clone()
 
-                # read foreground image and its segmentation map
-                ref_image, width, height, segmentation_map  = load_img(opt.ref_img, scale, seg=opt.seg, target_size=(target_width, target_height))
-                ref_image = repeat(ref_image.to(device), '1 ... -> b ...', b=batch_size)
+                # 3. 加载前景图并获取所有处理好的数据
+                ref_image, seg_512, seg_64, ref_bbox_px, latent_bbox, width, height = load_fg(
+                    fg_pil, seg_pil, (512, 512), opt.position
+                )
+                
+                print(f"width, height = {width},{height}")
+                
+                ref_image = ref_image.to(device)
+                seg_512 = seg_512.to(device)
+                seg_64 = seg_64.to(device)
+                # 4. 准备用于不同阶段的蒙版
+                
+                segmentation_map_save = seg_512.repeat(1, 3, 1, 1) # 用于像素合成
+                segmentation_map = seg_64.repeat(1, 4, 1, 1)       # 用于 latent 合成
 
-                segmentation_map_orig = repeat(torch.tensor(segmentation_map)[None, None, ...].to(device), '1 1 ... -> b 4 ...', b=batch_size)
-                segmentation_map_save = repeat(torch.tensor(segmentation_map)[None, None, ...].to(device), '1 1 ... -> b 3 ...', b=batch_size)
-                segmentation_map = segmentation_map_orig[:, :, ::8, ::8].to(device)
-
-                top_rr = int((0.5*(target_height - height))/target_height * init_image.shape[2])  # xx% from the top
-                bottom_rr = int((0.5*(target_height + height))/target_height * init_image.shape[2])  
-                left_rr = int((0.5*(target_width - width))/target_width * init_image.shape[3])  # xx% from the left
-                right_rr = int((0.5*(target_width + width))/target_width * init_image.shape[3]) 
-
+                # a. padded 图中的 foreground 坐标 [top, bottom, left, right]
+                top_rr,bottom_rr, left_rr, right_rr = ref_bbox_px
+                height = bottom_rr - top_rr
+                width = right_rr-left_rr
+                
+                # b. 最终粘贴到背景图上的坐标
+                target_height, target_width = 512, 512
                 center_row_rm = int(center_row_from_top * target_height)
                 center_col_rm = int(center_col_from_left * target_width)
+                step_h2, rem_h = divmod(height, 2); step_h1 = step_h2 + rem_h
+                step_w2, rem_w = divmod(width, 2); step_w1 = step_w2 + rem_w
+                
+                paste_y_slice = slice(center_row_rm - step_h1, center_row_rm + step_h2)
+                paste_x_slice = slice(center_col_rm - step_w1, center_col_rm + step_w2)
 
-                step_height2, remainder = divmod(height, 2)
-                step_height1 = step_height2 + remainder
-                step_width2, remainder = divmod(width, 2)
-                step_width1 = step_width2 + remainder
-                    
-                # compositing in pixel space for same-domain composition
-                save_image[:, :, center_row_rm - step_height1:center_row_rm + step_height2, center_col_rm - step_width1:center_col_rm + step_width2] \
-                        = save_image[:, :, center_row_rm - step_height1:center_row_rm + step_height2, center_col_rm - step_width1:center_col_rm + step_width2].clone() \
-                        * (1 - segmentation_map_save[:, :, top_rr:bottom_rr, left_rr:right_rr]) \
-                        + ref_image[:, :, top_rr:bottom_rr, left_rr:right_rr].clone() \
-                        * segmentation_map_save[:, :, top_rr:bottom_rr, left_rr:right_rr]
+                # c. latent space 的目标粘贴坐标
 
+                # --- 像素空间合成 ---
+                save_image = init_image.clone()
+                
+                bg_slice = save_image[..., paste_y_slice, paste_x_slice]
+                ref_slice = ref_image[..., top_rr:bottom_rr, left_rr:right_rr]
+                seg_slice = segmentation_map_save[..., top_rr:bottom_rr, left_rr:right_rr]
+
+                save_image[..., paste_y_slice, paste_x_slice] = bg_slice * (1 - seg_slice) + ref_slice * seg_slice
                 # save the mask and the pixel space composited image
                 save_mask = torch.zeros_like(init_image) 
-                save_mask[:, :, center_row_rm - step_height1:center_row_rm + step_height2, center_col_rm - step_width1:center_col_rm + step_width2] = 1
+                save_mask[:, :, center_row_rm - step_h1:center_row_rm + step_h2, center_col_rm - step_w1:center_col_rm + step_w2] = 1
 
-                # image = Image.fromarray(((save_mask) * 255)[0].permute(1,2,0).to(dtype=torch.uint8).cpu().numpy())
-                # image.save('./outputs/mask_bg_fg.jpg')
-                image = Image.fromarray(((save_image/torch.max(save_image.max(), abs(save_image.min())) + 1) * 127.5)[0].permute(1,2,0).to(dtype=torch.uint8).cpu().numpy())
-                image.save('./outputs/cp_bg_fg.jpg')
+                image = Image.fromarray(((save_mask) * 255)[0].permute(1,2,0).to(dtype=torch.uint8).cpu().numpy())
+                image.save('./outputs/mask_bg_fg.jpg')
+                save_image[..., paste_y_slice, paste_x_slice] = bg_slice * (1 - seg_slice) + ref_slice * seg_slice
+
+                save_image = torch.clamp(save_image, -1.0, 1.0)
+
+                # 2. 标准公式转换
+                image_to_save_numpy = ((save_image[0] + 1) * 127.5).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+
+                # 3. 保存
+                image_pil = Image.fromarray(image_to_save_numpy)
+                image_pil.save('./outputs/cp_bg_fg.jpg')                 
 
                 precision_scope = autocast if opt.precision == "autocast" else nullcontext
                 
@@ -402,15 +431,23 @@ def main():
                             
                             T1 = time.time()
                             init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_image))  
+                            ref_latent = model.get_first_stage_encoding(model.encode_first_stage(ref_image))
+                        
+                            # 1. 直接使用 load_fg 计算好的 latent_bbox 作为 param
+                            #    latent_bbox 的格式是 (top, bottom, left, right)
+                            ref_padded_location_latened = [int(ref_bbox_px[0]/8),int(ref_bbox_px[1]/8),int(ref_bbox_px[2]/8),int(ref_bbox_px[3]/8)]
                             
-                            # ref's location in ref image in the latent space
-                            top_rr = int((0.5*(target_height - height))/target_height * init_latent.shape[2])  
-                            bottom_rr = int((0.5*(target_height + height))/target_height * init_latent.shape[2])  
-                            left_rr = int((0.5*(target_width - width))/target_width * init_latent.shape[3])  
-                            right_rr = int((0.5*(target_width + width))/target_width * init_latent.shape[3]) 
-                                                    
-                            new_height = bottom_rr - top_rr
-                            new_width = right_rr - left_rr
+                            print(f"ref_padded_location_latened={ref_padded_location_latened}")
+                            # 2. 我们还需要 ref_image 中前景的 latent 坐标，以便从中提取特征
+
+                            ref_top_l =ref_padded_location_latened[0]
+                            ref_bottom_l = ref_padded_location_latened[1]
+                            ref_left_l = ref_padded_location_latened[2]
+                            ref_right_l = ref_padded_location_latened[3]
+                            print(f"ref_top_l,ref_bottom_l,ref_left_l,ref_right_={ref_top_l}, {ref_bottom_l}, {ref_left_l}, {ref_right_l}")
+                            
+                            new_height = ref_padded_location_latened[1] - ref_padded_location_latened[0]
+                            new_width = ref_padded_location_latened[3] - ref_padded_location_latened[2]
                             
                             step_height2, remainder = divmod(new_height, 2)
                             step_height1 = step_height2 + remainder
@@ -419,15 +456,13 @@ def main():
                             
                             center_row_rm = int(center_row_from_top * init_latent.shape[2])
                             center_col_rm = int(center_col_from_left * init_latent.shape[3])
-                            
-                            param = [max(0, int(center_row_rm - step_height1)), 
-                                    min(init_latent.shape[2] - 1, int(center_row_rm + step_height2)),
-                                    max(0, int(center_col_rm - step_width1)), 
-                                    min(init_latent.shape[3] - 1, int(center_col_rm + step_width2))]
-                            
+
+                            print (f"center_row_rm={center_row_rm},center_col_rm ={center_col_rm }")
+                                          
                             ref_latent = model.get_first_stage_encoding(model.encode_first_stage(ref_image))
                         
                             shape = [init_latent.shape[1], init_latent.shape[2], init_latent.shape[3]]
+                            print(f"init_latent.shape={init_latent.shape},width={width},heigth={height}")
                             z_enc, _ = sampler.sample(steps=opt.dpm_steps,
                                                     inv_emb=inv_emb,
                                                     unconditional_conditioning=uc,
@@ -462,7 +497,11 @@ def main():
                                                         )
                             
                             samples_orig = z_enc.clone()
+                        
 
+                            top_rr,bottom_rr, left_rr, right_rr = int(ref_bbox_px[0]/8),int(ref_bbox_px[1]/8),int(ref_bbox_px[2]/8),int(ref_bbox_px[3]/8)
+                            param = [latent_bbox[0], latent_bbox[1], latent_bbox[2], latent_bbox[3]]
+                            print(f"param before XOR{param}")
                             # inpainting in XOR region of M_seg and M_mask
                             z_enc[:, :, param[0]:param[1], param[2]:param[3]] \
                                 = z_enc[:, :, param[0]:param[1], param[2]:param[3]] \
@@ -516,18 +555,17 @@ def main():
                             
                             T2 = time.time()
                             print('Running Time: %s s' % ((T2 - T1)))
-                            
                             for x_sample in x_samples:
                                 x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
                                 img = Image.fromarray(x_sample.astype(np.uint8))
-                                img.save(os.path.join(sample_path, f"{base_count:05}_{prompts[0]}.png"))
-                                base_count += 1
+                                MyOutputPath=os.path.join(outpath,prompts[0])
+                                os.makedirs(MyOutputPath,exist_ok=True)
+                                img.save(os.path.join(MyOutputPath, "result.png"))
 
                 del x_samples, samples, z_enc, z_ref_enc, samples_orig, samples_for_cross, samples_ref, mask, x_sample, img, c, uc, inv_emb
                 del param, segmentation_map, top_rr, bottom_rr, left_rr, right_rr, target_height, target_width, center_row_rm, center_col_rm
-                del init_image, init_latent, save_image, ref_image, ref_latent, prompt, prompts, data, binary, contours
+                del init_image, init_latent, save_image, ref_image, ref_latent, prompt, prompts, data
 
-    print(f"Your samples are ready and waiting for you here: \n{sample_path} \nEnjoy.")
 
 
 if __name__ == "__main__":
