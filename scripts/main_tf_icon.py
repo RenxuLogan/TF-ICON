@@ -354,7 +354,6 @@ def main():
                 fg_pil = Image.open(opt.ref_img).convert("RGB")
                 seg_pil = Image.open(opt.seg).convert("L")
                 
-                print("fg的大小草尼玛TF-ICON",fg_pil.size,"fg的大小草尼玛TF-ICON",opt.ref_img)
                 
                 # 2. 加载背景图
                 init_image = load_bg(bg_pil).to(device)
